@@ -1,0 +1,99 @@
+name: Patch IPA with Frida (MediaFire)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare workspace
+        run: |
+          rm -rf work
+          mkdir -p work
+          cd work
+          pwd
+          ls -la
+
+      - name: Download IPA and FridaGadget from MediaFire
+        run: |
+          cd work
+          echo "Downloading IPA..."
+          curl -L -o crssplay_frida_localpatched.ipa "https://www.mediafire.com/file/ibgpjq8wpc0xh48/crssplay_frida_localpatched.ipa/file"
+          echo "Downloading frida dylib..."
+          curl -L -o frida-gadget-17.3.2-ios-universal.dylib "https://www.mediafire.com/file/hrgrwjfuq1bet4h/frida-gadget-17.3.2-ios-universal.dylib/file"
+          echo "Downloaded files:"
+          ls -lh
+
+      - name: Quick verify first bytes (confirm we downloaded binaries)
+        run: |
+          cd work
+          echo "IPA header (first 8 bytes hex):"
+          hexdump -C -n 8 crssplay_frida_localpatched.ipa || true
+          echo "dylib header (first 8 bytes hex):"
+          hexdump -C -n 8 frida-gadget-17.3.2-ios-universal.dylib || true
+
+      - name: Unpack IPA
+        run: |
+          cd work
+          mkdir -p unpack
+          unzip -o crssplay_frida_localpatched.ipa -d unpack || { echo "unzip failed"; ls -la; exit 1; }
+          echo "Payload contents:"
+          ls -la unpack/Payload || true
+
+      - name: Copy Frida dylib into app Frameworks
+        run: |
+          cd work/unpack/Payload
+          APP=$(ls -1 | grep '\.app' | head -n1)
+          if [ -z "$APP" ]; then echo "No .app found in Payload"; exit 1; fi
+          echo "Found app: $APP"
+          mkdir -p "$APP/Frameworks"
+          cp ../../frida-gadget-17.3.2-ios-universal.dylib "$APP/Frameworks/" || true
+          chmod 755 "$APP/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" || true
+          echo "Frameworks contents:"
+          ls -la "$APP/Frameworks"
+
+      - name: Try to add load instructions (install_name_tool, best-effort)
+        run: |
+          cd work/unpack/Payload
+          APP=$(ls -1 | grep '\.app' | head -n1)
+          # try default exe name 'dfxm' first, otherwise read Info.plist
+          EXE_PATH="$APP/dfxm"
+          if [ ! -f "$EXE_PATH" ]; then
+            if [ -f "$APP/Info.plist" ]; then
+              execname=$(defaults read "$APP/Info.plist" CFBundleExecutable 2>/dev/null || true)
+              if [ -n "$execname" ]; then
+                EXE_PATH="$APP/$execname"
+                echo "Resolved executable via Info.plist: $EXE_PATH"
+              fi
+            fi
+          fi
+          if [ ! -f "$EXE_PATH" ]; then
+            echo "ERROR: executable not found at expected locations. Listing app dir:"; ls -la "$APP"; exit 1
+          fi
+
+          echo "Adding rpath to executable (non-fatal if fails)..."
+          install_name_tool -add_rpath "@executable_path/Frameworks" "$EXE_PATH" || echo "add_rpath failed (ok)"
+
+          echo "Attempting to change any existing reference to frida (best-effort)..."
+          install_name_tool -change "frida-gadget-17.3.2-ios-universal.dylib" "@executable_path/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" "$EXE_PATH" || echo "change failed or not needed"
+
+          echo "Binary check:"
+          ls -lh "$EXE_PATH"
+          hexdump -C -n 32 "$EXE_PATH" || true
+
+      - name: Repack IPA
+        run: |
+          cd work/unpack
+          zip -r ../crssplay_frida_patched.ipa Payload
+          cd ..
+          ls -lh crssplay_frida_patched.ipa || true
+
+      - name: Upload patched IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crssplay_frida_patched
+          path: work/crssplay_frida_patched.ipa
