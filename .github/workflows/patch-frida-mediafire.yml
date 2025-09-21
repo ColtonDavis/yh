@@ -1,4 +1,4 @@
-name: Patch IPA with Frida (Releases - robust unzip)
+name: Patch IPA with Frida
 
 on:
   workflow_dispatch:
@@ -6,122 +6,63 @@ on:
 jobs:
   patch:
     runs-on: macos-latest
-    timeout-minutes: 30
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Prepare workspace
-        run: |
-          rm -rf work && mkdir -p work work/unpack
+        run: mkdir -p work_unzip
 
-      - name: Download IPA and FridaGadget from Releases
+      - name: Download IPA and dylib
         run: |
-          cd work
-          curl -L -o crssplay_frida_localpatched.ipa "https://github.com/ColtonDavis/yh/releases/download/1/crssplay_frida_localpatched.ipa"
-          curl -L -o frida-gadget-17.3.2-ios-universal.dylib "https://github.com/ColtonDavis/yh/releases/download/1/frida-gadget-17.3.2-ios-universal.dylib"
-          ls -lh
+          curl -L "https://github.com/ColtonDavis/yh/releases/download/1/crssplay_frida_localpatched.ipa" -o crssplay_frida_localpatched.ipa
+          curl -L "https://github.com/ColtonDavis/yh/releases/download/1/frida-gadget-17.3.2-ios-universal.dylib" -o frida-gadget.dylib
 
-      - name: Quick verify first bytes
+      - name: Fix IPA filename (if GitHub renamed it)
         run: |
-          cd work
-          echo "IPA first 8 bytes (hex):"; hexdump -C -n 8 crssplay_frida_localpatched.ipa || true
-          head4=$(xxd -p -l 4 crssplay_frida_localpatched.ipa || true)
-          if [ "$head4" != "504b0304" ]; then
-            echo "ERROR: IPA does not start with PK.. (zip header). Aborting."; exit 2
+          if [ -f crssplay_frida_localpatched_ipa ]; then
+            mv crssplay_frida_localpatched_ipa crssplay_frida_localpatched.ipa
           fi
 
-      - name: Extract IPA (try ditto, then unzip diagnostic)
+      - name: Unpack IPA (use ditto instead of unzip)
         run: |
-          set -e
-          cd work
-          echo "Attempting extraction with ditto (more tolerant on macOS)..."
-          if ditto -xk crssplay_frida_localpatched.ipa unpack; then
-            echo "ditto extraction succeeded."
-            ls -la unpack || true
-          else
-            echo "ditto failed — will print diagnostics and try unzip listing."
-            echo "=== unzip -l output ==="
-            unzip -l crssplay_frida_localpatched.ipa || true
-            echo "=== verbose unzip test (may show path separators) ==="
-            unzip -v crssplay_frida_localpatched.ipa || true
-            echo "Attempting unzip to unpack (may still fail)..."
-            if unzip -o crssplay_frida_localpatched.ipa -d unpack; then
-              echo "unzip extraction succeeded."
-              ls -la unpack || true
-            else
-              echo "Both ditto and unzip failed. Showing first 256 bytes for inspection:"
-              hexdump -C -n 256 crssplay_frida_localpatched.ipa || true
-              echo "Listing file size and name exactly:"
-              ls -l crssplay_frida_localpatched.ipa || true
-              echo "FAIL: cannot extract IPA on runner — likely Windows-style paths inside ZIP."
-              exit 3
-            fi
-          fi
+          ditto -x -k crssplay_frida_localpatched.ipa work_unzip
+          echo "Contents of Payload:"
+          ls -la work_unzip/Payload || true
 
       - name: Copy Frida dylib into app Frameworks
         run: |
-          cd work/unpack/Payload
-          APP=$(ls -1 | grep '\.app' | head -n1)
-          if [ -z "$APP" ]; then echo "No .app found in Payload"; exit 1; fi
-          echo "App found: $APP"
-          mkdir -p "$APP/Frameworks"
-          cp ../../frida-gadget-17.3.2-ios-universal.dylib "$APP/Frameworks/" || true
-          chmod 755 "$APP/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" || true
-          ls -la "$APP/Frameworks"
+          APP_PATH=$(find work_unzip/Payload -type d -name "*.app" | head -n 1)
+          echo "App found: $APP_PATH"
+          mkdir -p "$APP_PATH/Frameworks"
+          cp frida-gadget.dylib "$APP_PATH/Frameworks/frida-gadget.dylib"
+          chmod 755 "$APP_PATH/Frameworks/frida-gadget.dylib"
+          ls -la "$APP_PATH/Frameworks"
 
-      - name: Ensure optool (try prebuilt then build)
+      - name: Ensure optool (prebuilt or build from source)
         run: |
-          set -e
-          cd $GITHUB_WORKSPACE
-          OPTZIP="https://github.com/alexzielenski/optool/releases/download/0.1/optool.zip"
-          if curl -sSL "$OPTZIP" -o optool.zip; then
-            unzip -o optool.zip -d optool_tmp || true
-            if [ -f optool_tmp/optool ]; then
-              chmod +x optool_tmp/optool
-              sudo mv optool_tmp/optool /usr/local/bin/optool || true
-            fi
+          brew install optool || true
+          if ! command -v optool &> /dev/null; then
+            git clone https://github.com/alexzielenski/optool.git
+            cd optool
+            xcodebuild -project optool.xcodeproj -configuration Release
+            sudo cp build/Release/optool /usr/local/bin/
           fi
-          if ! command -v optool >/dev/null 2>&1; then
-            git clone https://github.com/alexzielenski/optool.git optool_src
-            cd optool_src
-            make || true
-            if [ -f optool ]; then
-              sudo mv optool /usr/local/bin/optool
-            else
-              echo "optool build failed"; ls -la; exit 1
-            fi
-          fi
-          /usr/local/bin/optool --version || true
 
-      - name: Inject LC_LOAD_DYLIB into main executable (optool)
+      - name: Inject LC_LOAD_DYLIB into main executable
         run: |
-          cd work/unpack/Payload
-          APP=$(ls -1 | grep '\.app' | head -n1)
-          EXE="$APP/dfxm"
-          if [ ! -f "$EXE" ]; then
-            if [ -f "$APP/Info.plist" ]; then
-              execname=$(defaults read "$APP/Info.plist" CFBundleExecutable 2>/dev/null || true)
-              if [ -n "$execname" ]; then
-                EXE="$APP/$execname"
-              fi
-            fi
-          fi
-          if [ ! -f "$EXE" ]; then
-            echo "ERROR: executable not found in $APP"; ls -la "$APP"; exit 1
-          fi
-          echo "Injecting into $EXE"
-          sudo /usr/local/bin/optool install -c load -p "@executable_path/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" -t "$EXE" || { echo "optool failed"; exit 1; }
+          APP_PATH=$(find work_unzip/Payload -type d -name "*.app" | head -n 1)
+          EXECUTABLE=$(defaults read "$APP_PATH/Info.plist" CFBundleExecutable)
+          echo "Injecting into $APP_PATH/$EXECUTABLE"
+          optool install -c load -p "@executable_path/Frameworks/frida-gadget.dylib" -t "$APP_PATH/$EXECUTABLE"
 
       - name: Repack IPA
         run: |
-          cd work/unpack
-          zip -r ../crssplay_frida_patched.ipa Payload
-          cd ..
-          ls -lh crssplay_frida_patched.ipa || true
+          cd work_unzip
+          zip -qr ../crssplay_frida_patched.ipa Payload
 
       - name: Upload patched IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: crssplay_frida_patched
-          path: work/crssplay_frida_patched.ipa
+          path: crssplay_frida_patched.ipa
