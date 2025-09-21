@@ -1,4 +1,4 @@
-name: Patch IPA with Frida (MediaFire)
+name: Patch IPA with Frida (Releases)
 
 on:
   workflow_dispatch:
@@ -6,42 +6,39 @@ on:
 jobs:
   patch:
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Prepare workspace
         run: |
-          rm -rf work
-          mkdir -p work
-          cd work
-          pwd
-          ls -la
+          rm -rf work && mkdir -p work work/unpack
 
-      - name: Download IPA and FridaGadget from MediaFire
+      - name: Download IPA and FridaGadget from Releases
         run: |
           cd work
           echo "Downloading IPA..."
-          curl -L -o crssplay_frida_localpatched.ipa "https://www.mediafire.com/file/ibgpjq8wpc0xh48/crssplay_frida_localpatched.ipa/file"
+          curl -L -o crssplay_frida_localpatched.ipa "https://github.com/ColtonDavis/yh/releases/download/1/crssplay_frida_localpatched.ipa"
           echo "Downloading frida dylib..."
-          curl -L -o frida-gadget-17.3.2-ios-universal.dylib "https://www.mediafire.com/file/hrgrwjfuq1bet4h/frida-gadget-17.3.2-ios-universal.dylib/file"
-          echo "Downloaded files:"
+          curl -L -o frida-gadget-17.3.2-ios-universal.dylib "https://github.com/ColtonDavis/yh/releases/download/1/frida-gadget-17.3.2-ios-universal.dylib"
           ls -lh
 
-      - name: Quick verify first bytes (confirm we downloaded binaries)
+      - name: Quick verify first bytes
         run: |
           cd work
-          echo "IPA header (first 8 bytes hex):"
-          hexdump -C -n 8 crssplay_frida_localpatched.ipa || true
-          echo "dylib header (first 8 bytes hex):"
-          hexdump -C -n 8 frida-gadget-17.3.2-ios-universal.dylib || true
+          echo "IPA first 8 bytes (hex):"; hexdump -C -n 8 crssplay_frida_localpatched.ipa || true
+          echo "dylib first 8 bytes (hex):"; hexdump -C -n 8 frida-gadget-17.3.2-ios-universal.dylib || true
+          # early fail if IPA doesn't start with PK..
+          head4=$(xxd -p -l 4 crssplay_frida_localpatched.ipa || true)
+          if [ "$head4" != "504b0304" ]; then
+            echo "ERROR: IPA does not look like a ZIP (starts: $head4)"; exit 2
+          fi
 
       - name: Unpack IPA
         run: |
           cd work
-          mkdir -p unpack
           unzip -o crssplay_frida_localpatched.ipa -d unpack || { echo "unzip failed"; ls -la; exit 1; }
-          echo "Payload contents:"
           ls -la unpack/Payload || true
 
       - name: Copy Frida dylib into app Frameworks
@@ -49,41 +46,55 @@ jobs:
           cd work/unpack/Payload
           APP=$(ls -1 | grep '\.app' | head -n1)
           if [ -z "$APP" ]; then echo "No .app found in Payload"; exit 1; fi
-          echo "Found app: $APP"
+          echo "App found: $APP"
           mkdir -p "$APP/Frameworks"
           cp ../../frida-gadget-17.3.2-ios-universal.dylib "$APP/Frameworks/" || true
           chmod 755 "$APP/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" || true
-          echo "Frameworks contents:"
           ls -la "$APP/Frameworks"
 
-      - name: Try to add load instructions (install_name_tool, best-effort)
+      - name: Ensure optool (try prebuilt then build)
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          OPTZIP="https://github.com/alexzielenski/optool/releases/download/0.1/optool.zip"
+          if curl -sSL "$OPTZIP" -o optool.zip; then
+            unzip -o optool.zip -d optool_tmp || true
+            if [ -f optool_tmp/optool ]; then
+              chmod +x optool_tmp/optool
+              sudo mv optool_tmp/optool /usr/local/bin/optool || true
+            fi
+          fi
+          if ! command -v optool >/dev/null 2>&1; then
+            git clone https://github.com/alexzielenski/optool.git optool_src
+            cd optool_src
+            make || true
+            if [ -f optool ]; then
+              sudo mv optool /usr/local/bin/optool
+            else
+              echo "optool build failed"; ls -la; exit 1
+            fi
+          fi
+          /usr/local/bin/optool --version || true
+
+      - name: Inject LC_LOAD_DYLIB into main executable (optool)
         run: |
           cd work/unpack/Payload
           APP=$(ls -1 | grep '\.app' | head -n1)
-          # try default exe name 'dfxm' first, otherwise read Info.plist
-          EXE_PATH="$APP/dfxm"
-          if [ ! -f "$EXE_PATH" ]; then
+          # try default 'dfxm' first, else read Info.plist
+          EXE="$APP/dfxm"
+          if [ ! -f "$EXE" ]; then
             if [ -f "$APP/Info.plist" ]; then
               execname=$(defaults read "$APP/Info.plist" CFBundleExecutable 2>/dev/null || true)
               if [ -n "$execname" ]; then
-                EXE_PATH="$APP/$execname"
-                echo "Resolved executable via Info.plist: $EXE_PATH"
+                EXE="$APP/$execname"
               fi
             fi
           fi
-          if [ ! -f "$EXE_PATH" ]; then
-            echo "ERROR: executable not found at expected locations. Listing app dir:"; ls -la "$APP"; exit 1
+          if [ ! -f "$EXE" ]; then
+            echo "ERROR: executable not found in $APP"; ls -la "$APP"; exit 1
           fi
-
-          echo "Adding rpath to executable (non-fatal if fails)..."
-          install_name_tool -add_rpath "@executable_path/Frameworks" "$EXE_PATH" || echo "add_rpath failed (ok)"
-
-          echo "Attempting to change any existing reference to frida (best-effort)..."
-          install_name_tool -change "frida-gadget-17.3.2-ios-universal.dylib" "@executable_path/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" "$EXE_PATH" || echo "change failed or not needed"
-
-          echo "Binary check:"
-          ls -lh "$EXE_PATH"
-          hexdump -C -n 32 "$EXE_PATH" || true
+          echo "Injecting into $EXE"
+          sudo /usr/local/bin/optool install -c load -p "@executable_path/Frameworks/frida-gadget-17.3.2-ios-universal.dylib" -t "$EXE" || { echo "optool failed"; exit 1; }
 
       - name: Repack IPA
         run: |
